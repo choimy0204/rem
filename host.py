@@ -14,8 +14,10 @@ import os
 import secrets
 import select
 import socket
+import sys
 import threading
 import time
+import traceback
 from ctypes import wintypes
 from io import BytesIO
 
@@ -26,6 +28,7 @@ import display_mode
 import protocol as P
 from capture import MSS, Capture
 
+WINDOWED = sys.stdout is None  # 콘솔 없는 실행 (pythonw / --noconsole exe): 출력이 사라진다
 MAX_CLIENTS = 3
 KEEPALIVE_SEC = 2.0
 MAX_FPS = 144  # 실제 전송 fps 는 디스플레이 주사율과 인코딩 속도에 맞춰 이 값 이하로 정해진다
@@ -248,6 +251,16 @@ def message_box(text: str, title: str = "VirtualMonitor 호스트") -> None:
     ctypes.windll.user32.MessageBoxW(None, text, title, 0x40)  # MB_ICONINFORMATION
 
 
+def redirect_output_to_log() -> str:
+    """콘솔이 없을 때 print/오류 출력을 %LOCALAPPDATA%\\VirtualMonitor\\host.log 로 남긴다."""
+    folder = os.path.join(os.environ.get("LOCALAPPDATA", "."), "VirtualMonitor")
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, "host.log")
+    sys.stdout = sys.stderr = open(path, "a", encoding="utf-8", buffering=1)
+    print(f"\n==== {time.strftime('%Y-%m-%d %H:%M:%S')} 호스트 시작 ====")
+    return path
+
+
 def serve(srv: socket.socket, password: str) -> None:
     active = threading.BoundedSemaphore(MAX_CLIENTS)
     while True:
@@ -290,7 +303,10 @@ def run_tray(port: int, password: str) -> None:
 
     def setup(icon):
         icon.visible = True
-        icon.notify(f"주소 {', '.join(local_ips())}\n비밀번호 {password}", "VirtualMonitor 호스트 실행 중")
+        try:
+            icon.notify(f"주소 {', '.join(local_ips())}\n비밀번호 {password}", "VirtualMonitor 호스트 실행 중")
+        except Exception:  # 알림이 실패해도 아이콘/서버는 계속 돌아야 한다
+            traceback.print_exc()
 
     icon.run(setup)
 
@@ -309,9 +325,13 @@ def main() -> None:
         tray = False
 
     def fail(msg: str):
-        if tray:
+        print(msg)
+        if tray or WINDOWED:  # 콘솔이 없으면 메시지 상자로 알린다
             message_box(msg)
         raise SystemExit(msg)
+
+    if WINDOWED and not tray:
+        fail("pystray 가 없어 트레이 아이콘을 만들 수 없습니다. 'pip install -r requirements.txt' 후 다시 실행하세요.")
 
     set_dpi_aware()
     password = args.password or "".join(secrets.choice("23456789") for _ in range(6))
@@ -352,4 +372,11 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    log_path = redirect_output_to_log() if WINDOWED else None
+    try:
+        main()
+    except Exception:
+        traceback.print_exc()
+        if WINDOWED:
+            message_box(f"호스트가 오류로 종료되었습니다.\n\n{traceback.format_exc()[-600:]}\n로그: {log_path}")
+        raise
