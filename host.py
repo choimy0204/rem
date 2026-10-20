@@ -7,6 +7,7 @@
 트레이 아이콘으로 백그라운드 실행 (--console 이면 콘솔 창). 아이콘 우클릭 > 접속 정보 보기 / 종료
 """
 import argparse
+import base64
 import ctypes
 import hmac
 import json
@@ -32,7 +33,9 @@ WINDOWED = sys.stdout is None  # 콘솔 없는 실행 (pythonw / --noconsole exe
 MAX_CLIENTS = 3
 KEEPALIVE_SEC = 2.0
 MAX_FPS = 144  # 실제 전송 fps 는 디스플레이 주사율과 인코딩 속도에 맞춰 이 값 이하로 정해진다
-JPEG_QUALITY = 90
+JPEG_QUALITY = 75  # 90 -> 75: 인코딩 시간·프레임 크기가 대략 절반
+ACK_TIMEOUT_SEC = 1.0  # 이 시간 동안 ACK 가 없으면 흐름 제어를 풀고 계속 보낸다 (ACK 를 안 보내는 뷰어 대비)
+STATS_SEC = 5.0
 
 
 def set_dpi_aware() -> None:
@@ -43,6 +46,14 @@ def set_dpi_aware() -> None:
             ctypes.windll.user32.SetProcessDPIAware()
         except Exception:
             pass
+
+
+def set_high_res_timer() -> None:
+    """Windows 기본 타이머 해상도(15.6ms)로는 144Hz(6.9ms) 간격을 못 맞추므로 1ms 로 올린다."""
+    try:
+        ctypes.windll.winmm.timeBeginPeriod(1)
+    except Exception:
+        pass
 
 
 def _win_monitors() -> dict:
@@ -111,9 +122,8 @@ def local_ips() -> list[str]:
     return sorted(ips)
 
 
-def encode_frame(bgra, size, scale: float, quality: int, cur=None) -> bytes:
+def encode_frame(bgra, size, scale: float, quality: int) -> bytes:
     img = Image.frombuffer("RGB", size, bgra, "raw", "BGRX", 0, 1)
-    cursor.draw(img, cur)  # 캡처에는 커서가 없으므로 직접 그린다
     if scale < 0.999:
         w = max(1, int(img.width * scale))
         h = max(1, int(img.height * scale))
@@ -121,6 +131,37 @@ def encode_frame(bgra, size, scale: float, quality: int, cur=None) -> bytes:
     buf = BytesIO()
     img.save(buf, "JPEG", quality=quality)
     return buf.getvalue()
+
+
+def cursor_shape_msg(hcursor: int) -> dict:
+    icon, hx, hy = cursor.shape(hcursor)
+    buf = BytesIO()
+    icon.save(buf, "PNG")
+    return {"type": "cursor_shape", "id": hcursor, "hx": hx, "hy": hy,
+            "png": base64.b64encode(buf.getvalue()).decode("ascii")}
+
+
+class StreamStats:
+    """실제로 나가는 fps / 인코딩 시간 / 프레임 크기를 STATS_SEC 마다 로그로 남긴다 (병목 확인용)."""
+
+    def __init__(self, ip: str):
+        self.ip = ip
+        self.reset()
+
+    def reset(self) -> None:
+        self.start = time.monotonic()
+        self.frames = self.bytes = 0
+        self.encode_sec = 0.0
+
+    def add(self, size: int, encode_sec: float) -> None:
+        self.frames += 1
+        self.bytes += size
+        self.encode_sec += encode_sec
+        elapsed = time.monotonic() - self.start
+        if elapsed >= STATS_SEC:
+            print(f"[{self.ip}] 실제 {self.frames / elapsed:.1f}fps · 인코딩 평균 {self.encode_sec / self.frames * 1000:.1f}ms"
+                  f" · 프레임 평균 {self.bytes / self.frames / 1024:.0f}KB")
+            self.reset()
 
 
 def handle_client(conn: socket.socket, addr, password: str) -> None:
@@ -151,17 +192,28 @@ def handle_client(conn: socket.socket, addr, password: str) -> None:
         fps, quality, scale = MAX_FPS, JPEG_QUALITY, 1.0  # 항상 원본 해상도 + 최고 프레임 (fps 는 선택한 디스플레이 주사율)
         next_t = 0.0
         last_sent = 0.0
+        inflight = 0  # 보냈지만 뷰어가 아직 ACK 하지 않은 프레임 수
         cap = Capture()
-        last_frame = None  # 마지막으로 캡처한 화면 (커서만 움직였을 때 재사용)
         last_cur = None
+        sent_shapes: set[int] = set()  # 뷰어에 이미 보낸 커서 모양 (핸들)
+        stats = StreamStats(ip)
         try:
             while True:
                 now = time.monotonic()
-                wait = max(0.0, next_t - now) if index is not None else 1.0
+                if index is None:
+                    wait = 1.0
+                elif inflight >= P.MAX_INFLIGHT:
+                    wait = 0.05  # ACK 가 오면 select 가 바로 깨운다
+                else:
+                    wait = max(0.0, next_t - now)
                 readable, _, _ = select.select([conn], [], [], wait)
                 if readable:
                     conn.settimeout(10)
-                    cmd = P.recv_json(conn)
+                    mtype, payload = P.recv_msg(conn)
+                    if mtype == P.T_ACK:
+                        inflight = max(0, inflight - 1)
+                        continue
+                    cmd = json.loads(payload.decode("utf-8"))
                     c = cmd.get("cmd")
                     if c == "refresh":
                         cap.close()
@@ -178,7 +230,8 @@ def handle_client(conn: socket.socket, addr, password: str) -> None:
                             fps = min(MAX_FPS, max(1, displays[i]["hz"]))
                             last_sent = 0.0  # 첫 프레임은 즉시 보낸다
                             next_t = 0.0
-                            last_frame = last_cur = None
+                            inflight = 0
+                            last_cur = None
                             P.send_json(conn, {"type": "selected", "display": displays[i]})
                             print(f"[{ip}] {displays[i]['name']} 보기 시작 ({cap.backend}, 목표 {fps}fps)")
                         else:
@@ -188,24 +241,34 @@ def handle_client(conn: socket.socket, addr, password: str) -> None:
                         index = None
                     elif c == "bye":
                         return
-                if index is not None and time.monotonic() >= next_t:
-                    t = time.monotonic()
-                    # 변경 없음(None)이어도 첫 프레임/킵얼라이브 시점에는 강제로 한 장 보낸다
-                    frame = cap.grab(force=(t - last_sent > KEEPALIVE_SEC))
-                    cur = cursor.state(cap.d)
-                    if frame is not None:
-                        buf = frame[0]
-                        if not isinstance(buf, (bytes, bytearray)):
-                            buf = buf.tobytes()  # dxcam 프레임은 재사용될 수 있어 복사해 둔다
-                        last_frame = (buf, frame[1])
-                    elif cur != last_cur and last_frame is not None:
-                        frame = last_frame  # 화면은 그대로, 커서만 움직임
-                    if frame is not None:
-                        conn.settimeout(15)
-                        P.send_msg(conn, P.T_FRAME, encode_frame(frame[0], frame[1], scale, quality, cur))
-                        last_cur = cur
-                        last_sent = time.monotonic()
-                    next_t = t + 1.0 / fps
+                if index is None:
+                    continue
+
+                conn.settimeout(15)
+                # 커서는 영상과 따로, 바뀔 때만 보낸다 (프레임 인코딩을 기다리지 않으므로 빠르다)
+                cur = cursor.state(cap.d)
+                if cur != last_cur:
+                    if cur and cur[2] not in sent_shapes:
+                        P.send_json(conn, cursor_shape_msg(cur[2]))
+                        sent_shapes.add(cur[2])
+                    P.send_json(conn, {"type": "cursor", "pos": cur})
+                    last_cur = cur
+
+                now = time.monotonic()
+                if inflight and now - last_sent > ACK_TIMEOUT_SEC:
+                    inflight = 0
+                if inflight >= P.MAX_INFLIGHT or now < next_t:
+                    continue
+                # 변경 없음(None)이어도 첫 프레임/킵얼라이브 시점에는 강제로 한 장 보낸다
+                frame = cap.grab(force=(now - last_sent > KEEPALIVE_SEC))
+                if frame is not None:
+                    data = encode_frame(frame[0], frame[1], scale, quality)
+                    P.send_msg(conn, P.T_FRAME, data)
+                    inflight += 1
+                    last_sent = time.monotonic()
+                    stats.add(len(data), last_sent - now)
+                # 고정 간격을 유지한다 (인코딩이 늦었을 때만 밀린 만큼 건너뛰고 지금부터 다시 시작)
+                next_t = max(next_t + 1.0 / fps, now)
         finally:
             cap.close()
     except (ConnectionError, OSError, ValueError, json.JSONDecodeError):
@@ -334,6 +397,7 @@ def main() -> None:
         fail("pystray 가 없어 트레이 아이콘을 만들 수 없습니다. 'pip install -r requirements.txt' 후 다시 실행하세요.")
 
     set_dpi_aware()
+    set_high_res_timer()
     password = args.password or "".join(secrets.choice("23456789") for _ in range(6))
 
     # Windows 는 SO_REUSEADDR 로 같은 포트를 여러 프로세스가 같이 열 수 있다 -> 예전 호스트가 남아 있으면

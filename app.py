@@ -188,25 +188,35 @@ class ViewerWindow(tk.Toplevel):
         self.title(title)
         self.geometry("1280x720")
         self.configure(bg="black")
-        self.label = tk.Label(self, bg="black", bd=0)
-        self.label.pack(fill="both", expand=True)
+        self.canvas = tk.Canvas(self, bg="black", bd=0, highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True)
+        self.frame_item = self.canvas.create_image(0, 0, anchor="nw")
+        self.cursor_item = self.canvas.create_image(0, 0, anchor="nw", state="hidden")  # 영상 위에 따로 그리는 원격 커서
         self.seq = 0
-        self.src: Image.Image | None = None
+        self.full: Image.Image | None = None    # 호스트가 보낸 원본 프레임
+        self.fitted: Image.Image | None = None  # 디코딩 스레드가 창 크기에 맞춰 둔 프레임
         self.photo = None
+        self.cursor_photos: dict = {}  # (모양 id, 배율) -> PhotoImage
+        self.layout = (1.0, 0, 0)      # 영상 배율, 영상 왼쪽/위 여백 (커서 좌표 변환용)
+        self.cursor_key = None
         self.fullscreen = False
         self.dirty = False
         self.bind("<F11>", lambda e: self.set_fullscreen(not self.fullscreen))
         self.bind("<Escape>", lambda e: self.set_fullscreen(False))
         self.bind("<Double-Button-1>", lambda e: self.set_fullscreen(not self.fullscreen))
-        self.label.bind("<Configure>", lambda e: setattr(self, "dirty", True))
+        self.canvas.bind("<Configure>", self.on_resize)
         self.protocol("WM_DELETE_WINDOW", self.close)
         if fullscreen:
             self.set_fullscreen(True)
-        self.after(5, self.tick)
+        self.after(2, self.tick)
 
     def set_fullscreen(self, on: bool):
         self.fullscreen = on
         self.attributes("-fullscreen", on)
+        self.dirty = True
+
+    def on_resize(self, event):
+        self.client.view_size = (event.width, event.height)
         self.dirty = True
 
     def close(self):
@@ -218,25 +228,51 @@ class ViewerWindow(tk.Toplevel):
             return
         got = self.client.take_frame(self.seq)
         if got:
-            self.seq, self.src = got
+            self.seq, self.full, self.fitted = got
             self.dirty = True
-        if self.dirty and self.src is not None:
+        if self.dirty and self.full is not None:
             self.dirty = False
             self.render()
-        self.after(4, self.tick)  # 약 250Hz 폴링 -> 프레임 도착 즉시 표시
+        self.update_cursor()
+        self.after(2, self.tick)  # 프레임 도착 즉시 표시 (호스트/뷰어 모두 타이머 해상도를 1ms 로 올려 둔다)
 
     def render(self):
-        w, h = self.label.winfo_width(), self.label.winfo_height()
+        w, h = self.canvas.winfo_width(), self.canvas.winfo_height()
         if w < 2 or h < 2:
             return
-        iw, ih = self.src.size
-        if (iw, ih) == (w, h):
-            img = self.src
-        else:
-            s = min(w / iw, h / ih)
-            img = self.src.resize((max(1, int(iw * s)), max(1, int(ih * s))), Image.BILINEAR)
+        fit = RC.fit_size(self.full.size, (w, h))
+        # 보통은 디코딩 스레드가 이미 창 크기로 줄여 놓았다. 창 크기가 막 바뀐 경우에만 여기서 줄인다.
+        img = self.fitted if self.fitted.size == fit else self.full.resize(fit, Image.BILINEAR)
+        ox, oy = (w - fit[0]) // 2, (h - fit[1]) // 2
         self.photo = ImageTk.PhotoImage(img)
-        self.label.configure(image=self.photo)
+        self.canvas.itemconfigure(self.frame_item, image=self.photo)
+        self.canvas.coords(self.frame_item, ox, oy)
+        self.layout = (fit[0] / self.full.width, ox, oy)
+
+    def update_cursor(self):
+        cur = self.client.cursor_state()
+        key = (cur and cur[:3], self.layout)
+        if key == self.cursor_key:
+            return
+        self.cursor_key = key
+        if not cur or cur[3] is None:
+            self.canvas.itemconfigure(self.cursor_item, state="hidden")
+            return
+        x, y, shape_id, (icon, hx, hy) = cur
+        scale, ox, oy = self.layout
+        self.canvas.itemconfigure(self.cursor_item, image=self.cursor_photo(shape_id, icon, scale), state="normal")
+        self.canvas.coords(self.cursor_item, ox + (x - hx) * scale, oy + (y - hy) * scale)
+
+    def cursor_photo(self, shape_id: int, icon: Image.Image, scale: float):
+        key = (shape_id, round(scale, 3))
+        if key not in self.cursor_photos:
+            if len(self.cursor_photos) > 64:
+                self.cursor_photos.clear()
+            img = icon
+            if abs(scale - 1) > 0.01:
+                img = icon.resize((max(1, round(icon.width * scale)), max(1, round(icon.height * scale))), Image.BILINEAR)
+            self.cursor_photos[key] = ImageTk.PhotoImage(img)
+        return self.cursor_photos[key]
 
 
 class RemoteTab(ttk.Frame):
@@ -398,6 +434,7 @@ class RemoteTab(ttk.Frame):
 # ======================================================================
 def main():
     H.set_dpi_aware()
+    H.set_high_res_timer()
     root = tk.Tk()
     root.title("VirtualMonitor")
     root.geometry("640x470")

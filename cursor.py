@@ -1,13 +1,14 @@
-"""마우스 커서 합성용 도우미.
+"""마우스 커서 전송용 도우미.
 
-DXGI/GDI 캡처 화면에는 커서가 들어있지 않으므로, 호스트가 현재 커서 위치와 모양을 읽어 프레임에 직접 그린다.
+DXGI/GDI 캡처 화면에는 커서가 들어있지 않으므로, 호스트가 현재 커서 위치와 모양을 읽어 영상과 따로 뷰어에 보낸다
+(영상에 합성하면 커서가 움직일 때마다 프레임을 다시 인코딩해야 해서 커서가 늦어진다).
 커서 모양은 검은 배경/흰 배경에 각각 그려 알파를 복원한다 (알파 커서, 마스크 커서 모두 대응).
 """
 import ctypes
 from ctypes import wintypes
 
 import numpy as np
-from PIL import Image, ImageChops, ImageDraw
+from PIL import Image, ImageDraw
 
 user32 = ctypes.windll.user32
 gdi32 = ctypes.windll.gdi32
@@ -152,22 +153,23 @@ def overlay(hcursor: int):
     return r
 
 
-def draw(img: Image.Image, cur) -> None:
-    """RGB 이미지에 커서(state() 결과)를 합성한다."""
-    if not cur:
-        return
-    x, y, h = cur
-    o = overlay(h)
-    if not o:  # 모양을 못 읽은 커서도 위치는 보이도록 기본 화살표를 그린다
-        ImageDraw.Draw(img).polygon([(x + dx, y + dy) for dx, dy in _FALLBACK_ARROW],
-                                    fill=(255, 255, 255), outline=(0, 0, 0))
-    else:
-        icon, mask, hx, hy = o
-        ox, oy = x - hx, y - hy
-        if mask is not None:  # 반전 픽셀은 배경을 뒤집어서 그린다
-            x0, y0 = max(ox, 0), max(oy, 0)
-            x1, y1 = min(ox + icon.width, img.width), min(oy + icon.height, img.height)
-            if x1 > x0 and y1 > y0:
-                inverted = ImageChops.invert(img.crop((x0, y0, x1, y1)))
-                img.paste(inverted, (x0, y0), mask.crop((x0 - ox, y0 - oy, x1 - ox, y1 - oy)))
-        img.paste(icon, (ox, oy), icon)
+def _fallback_shape():
+    """모양을 못 읽은 커서도 위치는 보이도록 쓰는 기본 화살표."""
+    icon = Image.new("RGBA", (14, 22), (0, 0, 0, 0))
+    ImageDraw.Draw(icon).polygon(_FALLBACK_ARROW, fill=(255, 255, 255, 255), outline=(0, 0, 0, 255))
+    return icon, 0, 0
+
+
+def shape(hcursor: int):
+    """뷰어로 보낼 커서 모양 (RGBA 이미지, 핫스팟 x, 핫스팟 y).
+
+    화면 반전(XOR) 픽셀은 뷰어가 배경을 뒤집을 수 없으므로 어떤 배경에서나 보이는 회색으로 대신한다.
+    """
+    o = overlay(hcursor)
+    if not o:
+        return _fallback_shape()
+    icon, mask, hx, hy = o
+    if mask is not None:
+        icon = icon.copy()
+        icon.paste((128, 128, 128, 255), mask=mask)
+    return icon, hx, hy
