@@ -133,7 +133,7 @@ def handle_client(conn: socket.socket, addr, password: str) -> None:
             proof = bytes.fromhex(msg.get("proof", ""))
         except ValueError:
             proof = b""
-        if not hmac.compare_digest(proof, P.make_proof(password, nonce)):
+        if not hmac.compare_digest(proof, P.make_proof(password, nonce)):  # 호스트 콘솔에 이 메시지가 안 뜨면 다른 프로세스가 응답한 것
             time.sleep(1.0)  # 무차별 대입 지연
             P.send_json(conn, {"type": "error", "message": "인증 실패 (비밀번호 확인)"})
             print(f"[{ip}] 인증 실패")
@@ -241,6 +241,16 @@ def main() -> None:
 
     set_dpi_aware()
     password = args.password or "".join(secrets.choice("23456789") for _ in range(6))
+
+    # Windows 는 SO_REUSEADDR 로 같은 포트를 여러 프로세스가 같이 열 수 있다 -> 예전 호스트가 남아 있으면
+    # 접속이 그쪽(다른 비밀번호)으로 가서 '인증 실패'가 난다. 이미 떠 있으면 시작하지 않는다.
+    try:
+        socket.create_connection(("127.0.0.1", args.port), timeout=0.5).close()
+    except OSError:
+        pass
+    else:
+        raise SystemExit(f"이미 포트 {args.port} 에서 호스트가 실행 중입니다. 먼저 종료하세요 "
+                         "(작업 관리자에서 VirtualMonitorHost.exe / python.exe 종료).")
 
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

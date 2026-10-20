@@ -45,7 +45,7 @@ class RemoteClient:
             s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             s.settimeout(15)
             hello = P.recv_json(s)
-            proof = P.make_proof(password, bytes.fromhex(hello["nonce"]))
+            proof = P.make_proof(password.strip(), bytes.fromhex(hello["nonce"]))
             P.send_json(s, {"proof": proof.hex()})
             res = P.recv_json(s)
             if res.get("type") == "error":
