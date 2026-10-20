@@ -7,7 +7,7 @@ import ctypes
 from ctypes import wintypes
 
 import numpy as np
-from PIL import Image, ImageChops
+from PIL import Image, ImageChops, ImageDraw
 
 user32 = ctypes.windll.user32
 gdi32 = ctypes.windll.gdi32
@@ -59,6 +59,7 @@ class BITMAPINFOHEADER(ctypes.Structure):
 
 
 _cache: dict = {}
+_FALLBACK_ARROW = [(0, 0), (0, 17), (4, 13), (7, 20), (10, 19), (7, 12), (12, 12)]
 
 
 def state(display: dict):
@@ -112,7 +113,7 @@ def _render(hcursor):
         for fill in (0x00, 0xFF):
             ctypes.memset(bits, fill, size)
             user32.DrawIconEx(memdc, 0, 0, hcursor, w, h, 0, None, DI_NORMAL)
-            shots.append(np.frombuffer(ctypes.string_at(bits, size), np.uint8).reshape(h, w, 4)[:, :, :3].astype(np.int16))
+            shots.append(np.frombuffer(ctypes.string_at(bits, size), np.uint8).reshape(h, w, 4)[:, :, :3].astype(np.int32))  # int16 이면 *255 에서 오버플로
         black, white = shots
         diff = (white - black).mean(axis=2)  # 투명한 곳: 검정배경→0, 흰배경→255 → 차이 255
         invert = diff < -128  # 검정배경→흰색, 흰배경→검정: 화면 반전(XOR) 픽셀
@@ -157,7 +158,10 @@ def draw(img: Image.Image, cur) -> None:
         return
     x, y, h = cur
     o = overlay(h)
-    if o:
+    if not o:  # 모양을 못 읽은 커서도 위치는 보이도록 기본 화살표를 그린다
+        ImageDraw.Draw(img).polygon([(x + dx, y + dy) for dx, dy in _FALLBACK_ARROW],
+                                    fill=(255, 255, 255), outline=(0, 0, 0))
+    else:
         icon, mask, hx, hy = o
         ox, oy = x - hx, y - hy
         if mask is not None:  # 반전 픽셀은 배경을 뒤집어서 그린다

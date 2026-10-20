@@ -21,12 +21,13 @@ from io import BytesIO
 from PIL import Image
 
 import cursor
+import display_mode
 import protocol as P
 from capture import MSS, Capture
 
 MAX_CLIENTS = 3
 KEEPALIVE_SEC = 2.0
-MAX_FPS = 60
+MAX_FPS = 144  # 실제 전송 fps 는 디스플레이 주사율과 인코딩 속도에 맞춰 이 값 이하로 정해진다
 JPEG_QUALITY = 90
 
 
@@ -82,10 +83,12 @@ def list_displays() -> list[dict]:
         for i, m in enumerate(sct.monitors[1:]):  # [0] 은 전체 가상 화면
             key = (m["left"], m["top"], m["left"] + m["width"], m["top"] + m["height"])
             name, primary = extra.get(key, (f"DISPLAY{i + 1}", m["left"] == 0 and m["top"] == 0))
+            mode = display_mode.current_mode(name)
             displays.append({
                 "index": i,
                 "name": name,
                 "primary": primary,
+                "hz": mode[2] if mode else 60,
                 "left": m["left"], "top": m["top"],
                 "width": m["width"], "height": m["height"],
             })
@@ -141,7 +144,7 @@ def handle_client(conn: socket.socket, addr, password: str) -> None:
         # ---- 스트리밍 루프 ----
         displays = list_displays()
         index = None
-        fps, quality, scale = MAX_FPS, JPEG_QUALITY, 1.0  # 항상 원본 해상도 + 최고 프레임
+        fps, quality, scale = MAX_FPS, JPEG_QUALITY, 1.0  # 항상 원본 해상도 + 최고 프레임 (fps 는 선택한 디스플레이 주사율)
         next_t = 0.0
         last_sent = 0.0
         cap = Capture()
@@ -168,11 +171,12 @@ def handle_client(conn: socket.socket, addr, password: str) -> None:
                         if 0 <= i < len(displays):
                             index = i
                             cap.open(displays[i], displays)
+                            fps = min(MAX_FPS, max(1, displays[i]["hz"]))
                             last_sent = 0.0  # 첫 프레임은 즉시 보낸다
                             next_t = 0.0
                             last_frame = last_cur = None
                             P.send_json(conn, {"type": "selected", "display": displays[i]})
-                            print(f"[{ip}] {displays[i]['name']} 보기 시작 ({cap.backend})")
+                            print(f"[{ip}] {displays[i]['name']} 보기 시작 ({cap.backend}, 목표 {fps}fps)")
                         else:
                             P.send_json(conn, {"type": "error", "message": "잘못된 디스플레이 번호"})
                     elif c == "stop":
@@ -251,7 +255,7 @@ def main() -> None:
     print(" 연결된 디스플레이:")
     for d in list_displays():
         star = " (주)" if d["primary"] else ""
-        print(f"   [{d['index']}] {d['name']}{star} {d['width']}x{d['height']} @ ({d['left']},{d['top']})")
+        print(f"   [{d['index']}] {d['name']}{star} {d['width']}x{d['height']} {d['hz']}Hz @ ({d['left']},{d['top']})")
     print(" 종료: Ctrl+C")
     print("=" * 50)
 

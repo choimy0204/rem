@@ -11,7 +11,10 @@ import json
 import os
 import subprocess
 import sys
+import time
 import xml.etree.ElementTree as ET
+
+import display_mode
 
 CONFIG_PATH = r"C:\VirtualDisplayDriver\vdd_settings.xml"
 DEVICE_PATTERN = "Virtual Display Driver|MttVDD|IddSampleDriver"
@@ -143,51 +146,13 @@ def active_count() -> int:
     return get_count()
 
 
-class _DEVMODEW(ctypes.Structure):
-    _fields_ = [
-        ("dmDeviceName", ctypes.c_wchar * 32), ("dmSpecVersion", ctypes.c_ushort),
-        ("dmDriverVersion", ctypes.c_ushort), ("dmSize", ctypes.c_ushort),
-        ("dmDriverExtra", ctypes.c_ushort), ("dmFields", ctypes.c_ulong),
-        ("dmPositionX", ctypes.c_long), ("dmPositionY", ctypes.c_long),
-        ("dmDisplayOrientation", ctypes.c_ulong), ("dmDisplayFixedOutput", ctypes.c_ulong),
-        ("dmColor", ctypes.c_short), ("dmDuplex", ctypes.c_short),
-        ("dmYResolution", ctypes.c_short), ("dmTTOption", ctypes.c_short),
-        ("dmCollate", ctypes.c_short), ("dmFormName", ctypes.c_wchar * 32),
-        ("dmLogPixels", ctypes.c_ushort), ("dmBitsPerPel", ctypes.c_ulong),
-        ("dmPelsWidth", ctypes.c_ulong), ("dmPelsHeight", ctypes.c_ulong),
-        ("dmDisplayFlags", ctypes.c_ulong), ("dmDisplayFrequency", ctypes.c_ulong),
-        ("dmICMMethod", ctypes.c_ulong), ("dmICMIntent", ctypes.c_ulong),
-        ("dmMediaType", ctypes.c_ulong), ("dmDitherType", ctypes.c_ulong),
-        ("dmReserved1", ctypes.c_ulong), ("dmReserved2", ctypes.c_ulong),
-        ("dmPanningWidth", ctypes.c_ulong), ("dmPanningHeight", ctypes.c_ulong),
-    ]
-
-
-def set_display_mode(device_name: str, width: int, height: int, refresh: int | None = None) -> bool:
-    """디스플레이(예: \\\\.\\DISPLAY5)의 해상도/주사율을 바꾼다. 성공하면 True."""
-    user32 = ctypes.windll.user32
-    dm = _DEVMODEW()
-    dm.dmSize = ctypes.sizeof(_DEVMODEW)
-    if not user32.EnumDisplaySettingsW(device_name, -1, ctypes.byref(dm)):  # ENUM_CURRENT_SETTINGS
-        return False
-    dm.dmPelsWidth, dm.dmPelsHeight = width, height
-    fields = 0x80000 | 0x100000  # DM_PELSWIDTH | DM_PELSHEIGHT
-    for hz in ([refresh] if refresh else []) + [None]:  # 주사율이 안 맞으면 해상도만 적용
-        if hz:
-            dm.dmDisplayFrequency = hz
-        dm.dmFields = fields | (0x400000 if hz else 0)  # DM_DISPLAYFREQUENCY
-        if user32.ChangeDisplaySettingsExW(device_name, ctypes.byref(dm), None, 1, None) == 0:  # CDS_UPDATEREGISTRY
-            return True
-    return False
-
-
 def _display_names() -> list[str]:
     import host  # 지연 import (host 는 이 모듈을 쓰지 않는다)
     return [d["name"] for d in host.list_displays()]
 
 
-def create_display(width: int = 1920, height: int = 1080, refresh: int = 60) -> int:
-    """가상 디스플레이 1개 추가. 만들어진 뒤의 총 개수를 반환."""
+def create_display(width: int = 1920, height: int = 1080, refresh: int = 60) -> tuple[int, str]:
+    """가상 디스플레이 1개 추가. (만들어진 뒤의 총 개수, 해상도/주사율 적용 경고 문구 - 정상이면 빈 문자열)."""
     if not is_admin():
         raise VddError("관리자 권한이 필요합니다.")
     dev = find_device()
@@ -200,18 +165,28 @@ def create_display(width: int = 1920, height: int = 1080, refresh: int = 60) -> 
     _write_config(n, width, height, refresh)
     _restart(dev)  # 비활성 상태였다면 활성화로 끝난다
 
-    # 새로 생긴 모니터는 Windows 가 가장 작은 모드(800x600)로 잡으므로 고른 해상도를 직접 적용한다
-    import time
+    # 새로 생긴 모니터는 Windows 가 가장 작은 모드(800x600)로 잡으므로 고른 해상도를 직접 적용하고, 실제로 먹혔는지 확인한다
+    want = (width, height, refresh)
+    warnings = []
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
         new = [x for x in _display_names() if x not in before]
         if new:
             time.sleep(1.0)  # 모니터가 안정될 때까지 잠깐 대기
             for name in new:
-                set_display_mode(name, width, height, refresh)
+                if not display_mode.supports_mode(name, *want):
+                    warnings.append(f"드라이버가 {width}x{height} @{refresh}Hz 모드를 제공하지 않습니다 "
+                                    f"(vdd_settings.xml 의 g_refresh_rate/resolution 확인).")
+                display_mode.set_mode(name, *want)
+                got = display_mode.current_mode(name)
+                if got != want:
+                    shown = f"{got[0]}x{got[1]} @{got[2]}Hz" if got else "확인 불가"
+                    warnings.append(f"{name}: 요청 {width}x{height} @{refresh}Hz → 실제 {shown}")
             break
         time.sleep(0.5)
-    return n
+    else:
+        warnings.append("새 디스플레이를 찾지 못해 해상도/주사율을 적용하지 못했습니다. [새로고침] 후 확인하세요.")
+    return n, "\n".join(warnings)
 
 
 def delete_display() -> int:

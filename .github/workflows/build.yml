@@ -1,0 +1,27 @@
+name: build-exe
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt pyinstaller
+      - run: >
+          python -m PyInstaller --noconfirm --onefile --noconsole --name VirtualMonitor
+          --collect-all dxcam --collect-all comtypes
+          --distpath dist --workpath build --specpath build app.py
+      - run: >
+          python -m PyInstaller --noconfirm --onefile --name VirtualMonitorHost
+          --collect-all dxcam --collect-all comtypes
+          --distpath dist --workpath build --specpath build host.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VirtualMonitor
+          path: dist/*.exe

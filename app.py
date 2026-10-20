@@ -65,8 +65,8 @@ class VirtualTab(ttk.Frame):
         self.btn_install = ttk.Button(btns, text="드라이버 설치 (winget)", command=self.install)
 
         ttk.Label(self, text="현재 연결된 디스플레이 (우클릭 > 디스플레이 설정과 동일)").pack(anchor="w", pady=(10, 2))
-        self.tree = ttk.Treeview(self, columns=("n", "name", "size", "pos"), show="headings", height=7)
-        for c, t, w in (("n", "번호", 50), ("name", "장치", 150), ("size", "해상도", 110), ("pos", "위치", 110)):
+        self.tree = ttk.Treeview(self, columns=("n", "name", "size", "hz", "pos"), show="headings", height=7)
+        for c, t, w in (("n", "번호", 50), ("name", "장치", 150), ("size", "해상도", 110), ("hz", "주사율", 70), ("pos", "위치", 110)):
             self.tree.heading(c, text=t)
             self.tree.column(c, width=w, anchor="w")
         self.tree.pack(fill="both", expand=True)
@@ -118,7 +118,7 @@ class VirtualTab(ttk.Frame):
             for d in displays:
                 self.tree.insert("", "end", values=(
                     d["index"], d["name"] + (" (주)" if d["primary"] else ""),
-                    f"{d['width']}x{d['height']}", f"({d['left']}, {d['top']})"))
+                    f"{d['width']}x{d['height']}", f"{d['hz']}Hz", f"({d['left']}, {d['top']})"))
 
         run_async(self, work, done)
 
@@ -133,10 +133,12 @@ class VirtualTab(ttk.Frame):
             return
         self._set_busy(True, "가상 디스플레이를 만드는 중... (몇 초 걸립니다)")
 
-        def done(n, err):
+        def done(res, err):
             self._set_busy(False, "")
             if err:
                 messagebox.showerror("만들기 실패", str(err))
+            elif res[1]:
+                messagebox.showwarning("해상도/주사율이 그대로 적용되지 않았습니다", res[1])
             self.after(1500, self.refresh)
 
         run_async(self, lambda: VD.create_display(w, h, hz), done)
@@ -278,7 +280,7 @@ class RemoteTab(ttk.Frame):
         self.status = tk.StringVar(value="호스트 PC 의 IP 와 비밀번호를 입력하고 [접속]을 누르세요.")
         ttk.Label(self, textvariable=self.status, wraplength=560).pack(anchor="w", pady=(14, 0))
         ttk.Label(self, foreground="#666", wraplength=560, text=(
-            "항상 원본(최고) 해상도 · 최대 60fps 로 전송합니다.\n"
+            "항상 원본(최고) 해상도 · 디스플레이 주사율(최대 144fps)에 맞춰 전송합니다.\n"
             "보기 창: F11 / 더블클릭 = 전체화면 전환, Esc = 전체화면 해제, 창 닫기 = 종료")
         ).pack(anchor="w", pady=(10, 0))
 
@@ -334,7 +336,7 @@ class RemoteTab(ttk.Frame):
     def _fill_displays(self, displays):
         self.displays = displays
         labels = [
-            f"[{d['index']}] {d['name']}{' (주)' if d['primary'] else ''}  {d['width']}x{d['height']}"
+            f"[{d['index']}] {d['name']}{' (주)' if d['primary'] else ''}  {d['width']}x{d['height']} {d.get('hz', 60)}Hz"
             for d in displays]
         self.disp.configure(state="readonly", values=labels)
         if labels:
