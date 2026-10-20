@@ -3,25 +3,39 @@ on:
   workflow_dispatch:
   push:
     branches: [main, master]
+    paths-ignore: ["**.md", "*.bat"]
+
+# 같은 브랜치에 연달아 push 하면 이전 빌드는 취소한다
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:  # exe 두 개를 동시에 빌드한다
+        include:
+          - name: VirtualMonitor
+            script: app.py
+            extra: ""
+          - name: VirtualMonitorHost
+            script: host.py
+            extra: --hidden-import pystray._win32
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
       - run: pip install -r requirements.txt pyinstaller
       - run: >
-          python -m PyInstaller --noconfirm --onefile --noconsole --name VirtualMonitor
-          --collect-all dxcam --collect-all comtypes
-          --distpath dist --workpath build --specpath build app.py
-      - run: >
-          python -m PyInstaller --noconfirm --onefile --noconsole --name VirtualMonitorHost
-          --collect-all dxcam --collect-all comtypes --hidden-import pystray._win32
-          --distpath dist --workpath build --specpath build host.py
+          python -m PyInstaller --noconfirm --onefile --noconsole --name ${{ matrix.name }}
+          --collect-all dxcam --collect-all comtypes ${{ matrix.extra }}
+          --distpath dist --workpath build --specpath build ${{ matrix.script }}
       - uses: actions/upload-artifact@v4
         with:
-          name: VirtualMonitor
-          path: dist/*.exe
+          name: ${{ matrix.name }}
+          path: dist/${{ matrix.name }}.exe
