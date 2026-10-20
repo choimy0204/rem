@@ -2,3 +2,4 @@ mss>=9.0
 Pillow>=10.0
 dxcam>=0.3
 numpy
+pystray>=0.19

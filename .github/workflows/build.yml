@@ -18,8 +18,8 @@ jobs:
           --collect-all dxcam --collect-all comtypes
           --distpath dist --workpath build --specpath build app.py
       - run: >
-          python -m PyInstaller --noconfirm --onefile --name VirtualMonitorHost
-          --collect-all dxcam --collect-all comtypes
+          python -m PyInstaller --noconfirm --onefile --noconsole --name VirtualMonitorHost
+          --collect-all dxcam --collect-all comtypes --hidden-import pystray._win32
           --distpath dist --workpath build --specpath build host.py
       - uses: actions/upload-artifact@v4
         with:

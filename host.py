@@ -3,7 +3,8 @@
 - 연결된 디스플레이 목록(가상 디스플레이 포함)을 뷰어에 알려주고
 - 뷰어가 선택한 디스플레이 '하나'만 JPEG 로 스트리밍한다. (보기 전용, 입력 제어 없음)
 
-사용:  python host.py [--password 1234] [--port 50505]
+사용:  python host.py [--password 1234] [--port 50505] [--console]
+트레이 아이콘으로 백그라운드 실행 (--console 이면 콘솔 창). 아이콘 우클릭 > 접속 정보 보기 / 종료
 """
 import argparse
 import ctypes
@@ -18,7 +19,7 @@ import time
 from ctypes import wintypes
 from io import BytesIO
 
-from PIL import Image
+from PIL import Image, ImageDraw
 
 import cursor
 import display_mode
@@ -233,11 +234,84 @@ def discovery_responder(port: int) -> None:
             return
 
 
+def info_text(port: int, password: str) -> str:
+    lines = [f"접속 주소 : {', '.join(local_ips()) or '(IP 확인 불가)'}  포트 {port}",
+             f"비밀번호  : {password}",
+             "연결된 디스플레이:"]
+    for d in list_displays():
+        star = " (주)" if d["primary"] else ""
+        lines.append(f"  [{d['index']}] {d['name']}{star} {d['width']}x{d['height']} {d['hz']}Hz @ ({d['left']},{d['top']})")
+    return "\n".join(lines)
+
+
+def message_box(text: str, title: str = "VirtualMonitor 호스트") -> None:
+    ctypes.windll.user32.MessageBoxW(None, text, title, 0x40)  # MB_ICONINFORMATION
+
+
+def serve(srv: socket.socket, password: str) -> None:
+    active = threading.BoundedSemaphore(MAX_CLIENTS)
+    while True:
+        conn, addr = srv.accept()
+        if not active.acquire(blocking=False):
+            conn.close()
+            continue
+
+        def run(c=conn, a=addr):
+            try:
+                handle_client(c, a, password)
+            finally:
+                active.release()
+
+        threading.Thread(target=run, daemon=True).start()
+
+
+def tray_icon_image() -> Image.Image:
+    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    blue = (37, 99, 235, 255)
+    d.rounded_rectangle((4, 8, 60, 44), 6, fill=blue)  # 모니터
+    d.rectangle((9, 13, 55, 39), fill=(219, 234, 254, 255))  # 화면
+    d.rectangle((28, 44, 36, 52), fill=blue)  # 목
+    d.rectangle((18, 52, 46, 57), fill=blue)  # 받침
+    return img
+
+
+def run_tray(port: int, password: str) -> None:
+    """트레이 아이콘을 띄우고 메뉴의 [종료] 를 누를 때까지 대기한다 (서버는 다른 스레드에서 돈다)."""
+    import pystray
+
+    def show(_icon=None, _item=None):
+        threading.Thread(target=message_box, args=(info_text(port, password),), daemon=True).start()
+
+    icon = pystray.Icon(
+        "VirtualMonitorHost", tray_icon_image(), f"VirtualMonitor 호스트 ({', '.join(local_ips())})",
+        menu=pystray.Menu(pystray.MenuItem("접속 정보 보기", show, default=True),
+                          pystray.MenuItem("종료", lambda icon, _item: icon.stop())))
+
+    def setup(icon):
+        icon.visible = True
+        icon.notify(f"주소 {', '.join(local_ips())}\n비밀번호 {password}", "VirtualMonitor 호스트 실행 중")
+
+    icon.run(setup)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="VirtualMonitor 호스트")
     ap.add_argument("--port", type=int, default=P.PORT)
     ap.add_argument("--password", help="미지정 시 실행할 때마다 임의 생성")
+    ap.add_argument("--console", action="store_true", help="트레이 아이콘 대신 콘솔 창에서 실행")
     args = ap.parse_args()
+
+    try:
+        import pystray  # noqa: F401
+        tray = not args.console
+    except Exception:  # 미설치 -> 콘솔 모드
+        tray = False
+
+    def fail(msg: str):
+        if tray:
+            message_box(msg)
+        raise SystemExit(msg)
 
     set_dpi_aware()
     password = args.password or "".join(secrets.choice("23456789") for _ in range(6))
@@ -249,41 +323,30 @@ def main() -> None:
     except OSError:
         pass
     else:
-        raise SystemExit(f"이미 포트 {args.port} 에서 호스트가 실행 중입니다. 먼저 종료하세요 "
-                         "(작업 관리자에서 VirtualMonitorHost.exe / python.exe 종료).")
+        fail(f"이미 포트 {args.port} 에서 호스트가 실행 중입니다. 먼저 종료하세요 (3_호스트_종료.bat).")
 
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(("0.0.0.0", args.port))
+    try:
+        srv.bind(("0.0.0.0", args.port))
+    except OSError as e:
+        fail(f"포트 {args.port} 를 열 수 없습니다: {e}")
     srv.listen(5)
     threading.Thread(target=discovery_responder, args=(args.port,), daemon=True).start()
 
+    if tray:
+        threading.Thread(target=serve, args=(srv, password), daemon=True).start()
+        run_tray(args.port, password)
+        return
+
     print("=" * 50)
     print(" VirtualMonitor 호스트 실행 중")
-    print(f" 접속 주소 : {', '.join(local_ips()) or '(IP 확인 불가)'}  포트 {args.port}")
-    print(f" 비밀번호  : {password}")
-    print(" 연결된 디스플레이:")
-    for d in list_displays():
-        star = " (주)" if d["primary"] else ""
-        print(f"   [{d['index']}] {d['name']}{star} {d['width']}x{d['height']} {d['hz']}Hz @ ({d['left']},{d['top']})")
+    for line in info_text(args.port, password).splitlines():
+        print(" " + line)
     print(" 종료: Ctrl+C")
     print("=" * 50)
-
-    active = threading.BoundedSemaphore(MAX_CLIENTS)
     try:
-        while True:
-            conn, addr = srv.accept()
-            if not active.acquire(blocking=False):
-                conn.close()
-                continue
-
-            def run(c=conn, a=addr):
-                try:
-                    handle_client(c, a, password)
-                finally:
-                    active.release()
-
-            threading.Thread(target=run, daemon=True).start()
+        serve(srv, password)
     except KeyboardInterrupt:
         print("\n종료합니다.")
 
