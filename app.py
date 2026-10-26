@@ -3,6 +3,7 @@
 실행:  python app.py
 """
 import queue
+import sys
 import threading
 import time
 import tkinter as tk
@@ -498,6 +499,8 @@ class RemoteTab(ttk.Frame):
 
 # ======================================================================
 def main():
+    if "--selftest" in sys.argv:  # 빌드 검증용: import 가 모두 성공했으면 창을 띄우지 않고 종료한다
+        return
     H.set_dpi_aware()
     H.set_high_res_timer()
     root = tk.Tk()

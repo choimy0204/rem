@@ -549,6 +549,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    if "--selftest" in sys.argv:  # 빌드 검증용: 위의 import 가 모두 성공했으면 바로 종료한다
+        sys.exit(0)
     log_path = redirect_output_to_log() if WINDOWED else None
     try:
         main()

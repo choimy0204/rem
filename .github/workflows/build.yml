@@ -35,6 +35,12 @@ jobs:
           python -m PyInstaller --noconfirm --onefile --noconsole --name ${{ matrix.name }}
           --collect-all dxcam --collect-all comtypes ${{ matrix.extra }}
           --distpath dist --workpath build --specpath build ${{ matrix.script }}
+      - name: Smoke test (exe must start and import everything)
+        shell: pwsh
+        run: |
+          $p = Start-Process "dist\${{ matrix.name }}.exe" -ArgumentList "--selftest" -PassThru
+          if (-not $p.WaitForExit(60000)) { $p.Kill(); throw "exe did not exit within 60s (import error dialog?)" }
+          if ($p.ExitCode -ne 0) { throw "exe failed to start, exit code $($p.ExitCode)" }
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}
