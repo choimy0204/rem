@@ -20,9 +20,12 @@ import threading
 import time
 import traceback
 from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from ctypes import wintypes
 from io import BytesIO
 
+import cv2
+import numpy as np
 from PIL import Image, ImageDraw
 
 import cursor
@@ -37,6 +40,7 @@ MAX_FPS = 144  # 실제 전송 fps 는 디스플레이 주사율과 인코딩 �
 JPEG_QUALITY = 75  # 90 -> 75: 인코딩 시간·프레임 크기가 대략 절반
 ACK_TIMEOUT_SEC = 1.0  # 이 시간 동안 ACK 가 없으면 흐름 제어를 풀고 계속 보낸다 (ACK 를 안 보내는 뷰어 대비)
 STATS_SEC = 5.0
+ENCODE_THREADS = max(2, min(4, (os.cpu_count() or 4) // 2))  # JPEG 인코딩 스레드 수 (호스트 PC 의 다른 작업을 위해 코어 절반까지만)
 
 
 def set_dpi_aware() -> None:
@@ -123,15 +127,78 @@ def local_ips() -> list[str]:
     return sorted(ips)
 
 
-def encode_frame(bgra, size, scale: float, quality: int) -> bytes:
-    img = Image.frombuffer("RGB", size, bgra, "raw", "BGRX", 0, 1)
+def to_bgr(frame) -> np.ndarray:
+    """캡처 프레임(BGRA)을 BGR 로 복사한다. 캡처 버퍼는 다음 캡처에서 덮어써지므로 인코딩 스레드에는 복사본을 넘긴다."""
+    buf, (w, h) = frame
+    bgra = buf if isinstance(buf, np.ndarray) else np.frombuffer(buf, np.uint8).reshape(h, w, 4)
+    return cv2.cvtColor(bgra, cv2.COLOR_BGRA2BGR)
+
+
+def encode_frame(bgr: np.ndarray, scale: float, quality: int) -> bytes:
     if scale < 0.999:
-        w = max(1, int(img.width * scale))
-        h = max(1, int(img.height * scale))
-        img = img.resize((w, h), Image.BILINEAR)
-    buf = BytesIO()
-    img.save(buf, "JPEG", quality=quality)
-    return buf.getvalue()
+        h, w = bgr.shape[:2]
+        bgr = cv2.resize(bgr, (max(1, int(w * scale)), max(1, int(h * scale))), interpolation=cv2.INTER_AREA)
+    ok, jpeg = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, quality])
+    if not ok:
+        raise RuntimeError("JPEG 인코딩 실패")
+    return jpeg.tobytes()
+
+
+class EncodePipeline:
+    """JPEG 인코딩을 스레드 여러 개로 나눠 돌린다.
+
+    OpenCV 는 인코딩하는 동안 GIL 을 풀어서 코어 수만큼 빨라진다 (PIL 은 GIL 을 안 풀어 스레드로 빨라지지 않는다).
+    프레임은 서로 독립된 JPEG 라서 완료 순서는 상관없다: 끝난 것 중 가장 최신 하나만 보내고 오래된 것은 버린다.
+    결과 = (번호, JPEG, 캡처 시각, 캡처에 걸린 초, 인코딩에 걸린 초)
+    """
+
+    def __init__(self, threads: int):
+        self.threads = threads
+        self.pool = ThreadPoolExecutor(threads)
+        self.running: list[Future] = []
+        self.ready: tuple | None = None  # 끝난 것 중 가장 최신
+        self.seq = 0
+        self.taken_seq = 0  # 이미 꺼내 간 가장 최신 번호 (그보다 오래된 결과는 버린다)
+
+    def has_room(self) -> bool:
+        return len(self.running) < self.threads
+
+    def submit(self, bgr: np.ndarray, t_cap: float, capture_sec: float, scale: float, quality: int) -> None:
+        self.seq += 1
+        self.running.append(self.pool.submit(self._encode, self.seq, bgr, t_cap, capture_sec, scale, quality))
+
+    @staticmethod
+    def _encode(seq, bgr, t_cap, capture_sec, scale, quality):
+        start = time.monotonic()
+        jpeg = encode_frame(bgr, scale, quality)
+        return seq, jpeg, t_cap, capture_sec, time.monotonic() - start
+
+    def collect(self) -> None:
+        """끝난 인코딩을 거둬서 ready 를 가장 최신 결과로 갱신한다."""
+        unfinished = []
+        for f in self.running:
+            if not f.done():
+                unfinished.append(f)
+                continue
+            result = f.result()
+            if result[0] > self.taken_seq and (self.ready is None or result[0] > self.ready[0]):
+                self.ready = result
+        self.running = unfinished
+
+    def take(self) -> tuple | None:
+        result, self.ready = self.ready, None
+        if result:
+            self.taken_seq = result[0]
+        return result
+
+    def reset(self) -> None:
+        """진행 중이던 인코딩 결과를 모두 버린다 (디스플레이를 바꿀 때)."""
+        self.taken_seq = self.seq
+        self.running.clear()
+        self.ready = None
+
+    def close(self) -> None:
+        self.pool.shutdown(wait=False, cancel_futures=True)
 
 
 def cursor_shape_msg(hcursor: int) -> dict:
@@ -208,17 +275,23 @@ def handle_client(conn: socket.socket, addr, password: str) -> None:
         fps, quality, scale = MAX_FPS, JPEG_QUALITY, 1.0  # 항상 원본 해상도 + 최고 프레임 (fps 는 선택한 디스플레이 주사율)
         next_t = 0.0
         last_sent = 0.0
+        last_submit = 0.0  # 마지막으로 인코딩에 넘긴 시각 (킵얼라이브 판단용)
         inflight = 0  # 보냈지만 뷰어가 아직 ACK 하지 않은 프레임 수
         sent_times: deque[float] = deque()  # 각 미확인 프레임을 다 보낸 시각 (ACK 왕복 측정용)
         cap = Capture()
         last_cur = None
         sent_shapes: set[int] = set()  # 뷰어에 이미 보낸 커서 모양 (핸들)
         stats = StreamStats(ip)
+        pipeline = EncodePipeline(ENCODE_THREADS)
         try:
             while True:
                 now = time.monotonic()
                 if index is None:
                     wait = 1.0
+                elif pipeline.ready is not None and inflight < P.MAX_INFLIGHT:
+                    wait = 0.0  # 보낼 프레임이 준비됨
+                elif pipeline.running:
+                    wait = 0.001  # 인코딩이 끝나는 걸 짧게 폴링한다
                 elif inflight >= P.MAX_INFLIGHT:
                     wait = 0.05  # ACK 가 오면 select 가 바로 깨운다
                 else:
@@ -236,18 +309,20 @@ def handle_client(conn: socket.socket, addr, password: str) -> None:
                     c = cmd.get("cmd")
                     if c == "refresh":
                         cap.close()
+                        pipeline.reset()
                         displays = list_displays()
                         index = None
                         P.send_json(conn, {"type": "displays", "displays": displays})
                     elif c == "select":
                         cap.close()
+                        pipeline.reset()
                         displays = list_displays()
                         i = int(cmd.get("index", 0))
                         if 0 <= i < len(displays):
                             index = i
                             cap.open(displays[i], displays)
                             fps = min(MAX_FPS, max(1, displays[i]["hz"]))
-                            last_sent = 0.0  # 첫 프레임은 즉시 보낸다
+                            last_sent = last_submit = 0.0  # 첫 프레임은 즉시 보낸다
                             next_t = 0.0
                             inflight = 0
                             sent_times.clear()
@@ -258,6 +333,7 @@ def handle_client(conn: socket.socket, addr, password: str) -> None:
                             P.send_json(conn, {"type": "error", "message": "잘못된 디스플레이 번호"})
                     elif c == "stop":
                         cap.close()
+                        pipeline.reset()
                         index = None
                     elif c == "ping":  # 뷰어가 지연/시계 차이를 재기 위한 핑
                         P.send_json(conn, {"type": "pong", "t": cmd.get("t"), "h": time.monotonic()})
@@ -280,23 +356,33 @@ def handle_client(conn: socket.socket, addr, password: str) -> None:
                 if inflight and now - last_sent > ACK_TIMEOUT_SEC:
                     inflight = 0
                     sent_times.clear()
-                if inflight >= P.MAX_INFLIGHT or now < next_t:
-                    continue
-                # 변경 없음(None)이어도 첫 프레임/킵얼라이브 시점에는 강제로 한 장 보낸다
-                frame = cap.grab(force=(now - last_sent > KEEPALIVE_SEC))
-                if frame is not None:
-                    t_cap = time.monotonic()
-                    jpeg = encode_frame(frame[0], frame[1], scale, quality)
-                    t_enc = time.monotonic()
-                    meta = P.FRAME_META.pack(t_cap, (t_cap - now) * 1000, (t_enc - t_cap) * 1000)
+
+                # 인코딩이 끝난 가장 최신 프레임을 보낸다
+                pipeline.collect()
+                if pipeline.ready is not None and inflight < P.MAX_INFLIGHT:
+                    _, jpeg, t_cap, capture_sec, encode_sec = pipeline.take()
+                    meta = P.FRAME_META.pack(t_cap, capture_sec * 1000, encode_sec * 1000)
+                    send_start = time.monotonic()
                     P.send_msg(conn, P.T_FRAME, meta + jpeg)
                     last_sent = time.monotonic()
                     inflight += 1
                     sent_times.append(last_sent)
-                    stats.add_frame(len(jpeg), t_cap - now, t_enc - t_cap, last_sent - t_enc)
+                    stats.add_frame(len(jpeg), capture_sec, encode_sec, last_sent - send_start)
+
+                # 새 프레임을 캡처해서 인코딩 스레드에 넘긴다
+                if inflight >= P.MAX_INFLIGHT or now < next_t or not pipeline.has_room():
+                    continue
+                # 변경 없음(None)이어도 첫 프레임/킵얼라이브 시점에는 강제로 한 장 보낸다
+                frame = cap.grab(force=(now - last_submit > KEEPALIVE_SEC))
+                if frame is not None:
+                    bgr = to_bgr(frame)
+                    t_cap = time.monotonic()
+                    pipeline.submit(bgr, t_cap, t_cap - now, scale, quality)
+                    last_submit = t_cap
                 # 고정 간격을 유지한다 (인코딩이 늦었을 때만 밀린 만큼 건너뛰고 지금부터 다시 시작)
                 next_t = max(next_t + 1.0 / fps, now)
         finally:
+            pipeline.close()
             cap.close()
     except (ConnectionError, OSError, ValueError, json.JSONDecodeError):
         pass

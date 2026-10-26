@@ -15,9 +15,13 @@ import time
 from collections import deque
 from io import BytesIO
 
+import cv2
+import numpy as np
 from PIL import Image
 
 import protocol as P
+
+DECODE_THREADS = 2  # 디코딩 스레드 수 (OpenCV 는 GIL 을 풀어서 병렬로 돈다. 144fps 를 따라가려면 하나로는 모자란다)
 
 
 def fit_size(src: tuple[int, int], box: tuple[int, int]) -> tuple[int, int]:
@@ -38,7 +42,9 @@ class RemoteClient:
         self._cursor = None  # (x, y, 모양 id) 또는 None
         self._shapes: dict[int, tuple[Image.Image, int, int]] = {}  # 모양 id -> (RGBA 이미지, 핫스팟 x, y)
         self.view_size: tuple[int, int] | None = None  # 보기 창 크기. 디코딩 스레드가 미리 이 크기로 줄여 둔다
-        self._pending: tuple[bytes, dict] | None = None  # 아직 디코딩 안 한 가장 최신 (JPEG, 진단 정보)
+        self._pending: tuple[int, bytes, dict] | None = None  # 아직 디코딩 안 한 가장 최신 (프레임 번호, JPEG, 진단 정보)
+        self._received = 0   # 받은 프레임 번호
+        self._published = 0  # 화면용으로 내보낸 가장 최신 프레임 번호 (스레드가 여럿이라 늦게 끝난 오래된 프레임을 걸러낸다)
         self._cond = threading.Condition()
         self._finished = False
         self._stopped = threading.Event()
@@ -72,8 +78,11 @@ class RemoteClient:
         with self._cond:
             if item is None:
                 self._finished = True
+            else:
+                self._received += 1
+                item = (self._received, *item)
             self._pending = item
-            self._cond.notify()
+            self._cond.notify_all()
 
     def _decode_loop(self) -> None:
         """JPEG 디코딩과 창 크기에 맞춘 축소를 수신 스레드/UI 스레드 밖에서 한다."""
@@ -83,23 +92,29 @@ class RemoteClient:
                     self._cond.wait()
                 if self._finished:
                     return
-                (jpeg, info), self._pending = self._pending, None
+                (number, jpeg, info), self._pending = self._pending, None
             start = time.monotonic()
-            try:
-                full = Image.open(BytesIO(jpeg))
-                full.load()
-            except Exception:
+            bgr = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)  # PIL 보다 몇 배 빠르다
+            if bgr is None:
                 continue
-            fitted = self._fit(full)
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            full = Image.fromarray(rgb)
+            fitted = self._fit(full, rgb)
             info["decode_ms"] = (time.monotonic() - start) * 1000
             info["decoded_at"] = time.monotonic()
             with self._lock:
+                if number < self._published:  # 다른 스레드가 더 최신 프레임을 이미 내보냈다
+                    continue
+                self._published = number
                 self._latest = (full, fitted, info)
                 self._seq += 1
 
-    def _fit(self, full: Image.Image) -> Image.Image:
+    def _fit(self, full: Image.Image, rgb: np.ndarray) -> Image.Image:
         size = fit_size(full.size, self.view_size) if self.view_size else full.size
-        return full if size == full.size else full.resize(size, Image.BILINEAR)
+        if size == full.size:
+            return full
+        method = cv2.INTER_AREA if size[0] < full.width else cv2.INTER_LINEAR  # 줄일 때는 AREA 가 가장 깨끗하다
+        return Image.fromarray(cv2.resize(rgb, size, interpolation=method))
 
     # ---- 연결 ----
     def connect(self, host: str, port: int, password: str) -> None:
@@ -124,7 +139,8 @@ class RemoteClient:
             s.settimeout(None)
             self.sock = s
             self._emit("connected", (hello, res["displays"]))
-            threading.Thread(target=self._decode_loop, daemon=True).start()
+            for _ in range(DECODE_THREADS):
+                threading.Thread(target=self._decode_loop, daemon=True).start()
             threading.Thread(target=self._ping_loop, daemon=True).start()
 
             while True:

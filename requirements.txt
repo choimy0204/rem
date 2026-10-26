@@ -3,3 +3,4 @@ Pillow>=10.0
 dxcam>=0.3
 numpy
 pystray>=0.19
+opencv-python-headless>=4.8
