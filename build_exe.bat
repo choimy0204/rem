@@ -1,5 +1,10 @@
 @echo off
 cd /d "%~dp0"
+python -c "import cv2, numpy, dxcam, pystray, mss, PIL" 2>nul
+if errorlevel 1 (
+  echo Missing Python packages. Run this first: python -m pip install -r requirements.txt
+  goto fail
+)
 echo [1/2] Building VirtualMonitor.exe (app: virtual display + remote)...
 python -m PyInstaller --noconfirm --onefile --noconsole --name VirtualMonitor --collect-all dxcam --collect-all comtypes --distpath dist --workpath build --specpath build app.py
 if errorlevel 1 goto fail
