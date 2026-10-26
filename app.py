@@ -4,7 +4,9 @@
 """
 import queue
 import threading
+import time
 import tkinter as tk
+from collections import deque
 from tkinter import messagebox, ttk
 
 from PIL import Image, ImageTk
@@ -179,7 +181,9 @@ class VirtualTab(ttk.Frame):
 
 # ======================================================================
 class ViewerWindow(tk.Toplevel):
-    """선택한 디스플레이만 보여주는 창. F11 전체화면 / Esc 전체화면 해제."""
+    """선택한 디스플레이만 보여주는 창. F11 전체화면 / Esc 전체화면 해제 / F3 지연 진단 표시."""
+
+    OVERLAY_REFRESH_SEC = 0.25
 
     def __init__(self, master, client: RC.RemoteClient, title: str, fullscreen: bool, on_close):
         super().__init__(master)
@@ -192,7 +196,14 @@ class ViewerWindow(tk.Toplevel):
         self.canvas.pack(fill="both", expand=True)
         self.frame_item = self.canvas.create_image(0, 0, anchor="nw")
         self.cursor_item = self.canvas.create_image(0, 0, anchor="nw", state="hidden")  # 영상 위에 따로 그리는 원격 커서
+        self.overlay_bg = self.canvas.create_rectangle(0, 0, 0, 0, fill="black", outline="", state="hidden")
+        self.overlay_text = self.canvas.create_text(8, 8, anchor="nw", fill="#7CFC00", font=("Consolas", 10), state="hidden")
+        self.show_overlay = False
+        self.overlay_at = 0.0
+        self.samples: deque = deque(maxlen=300)  # 화면에 그린 프레임마다의 단계별 시간 (F3 진단용)
         self.seq = 0
+        self.info: dict | None = None  # 마지막 프레임의 진단 정보
+        self.new_frame = False
         self.full: Image.Image | None = None    # 호스트가 보낸 원본 프레임
         self.fitted: Image.Image | None = None  # 디코딩 스레드가 창 크기에 맞춰 둔 프레임
         self.photo = None
@@ -202,6 +213,7 @@ class ViewerWindow(tk.Toplevel):
         self.fullscreen = False
         self.dirty = False
         self.bind("<F11>", lambda e: self.set_fullscreen(not self.fullscreen))
+        self.bind("<F3>", lambda e: self.toggle_overlay())
         self.bind("<Escape>", lambda e: self.set_fullscreen(False))
         self.bind("<Double-Button-1>", lambda e: self.set_fullscreen(not self.fullscreen))
         self.canvas.bind("<Configure>", self.on_resize)
@@ -228,12 +240,18 @@ class ViewerWindow(tk.Toplevel):
             return
         got = self.client.take_frame(self.seq)
         if got:
-            self.seq, self.full, self.fitted = got
-            self.dirty = True
+            self.seq, self.full, self.fitted, self.info = got
+            self.dirty = self.new_frame = True
         if self.dirty and self.full is not None:
             self.dirty = False
+            started = time.monotonic()
             self.render()
+            if self.new_frame:
+                self.new_frame = False
+                self.record_sample(started)
         self.update_cursor()
+        if self.show_overlay:
+            self.update_overlay()
         self.after(2, self.tick)  # 프레임 도착 즉시 표시 (호스트/뷰어 모두 타이머 해상도를 1ms 로 올려 둔다)
 
     def render(self):
@@ -248,6 +266,53 @@ class ViewerWindow(tk.Toplevel):
         self.canvas.itemconfigure(self.frame_item, image=self.photo)
         self.canvas.coords(self.frame_item, ox, oy)
         self.layout = (fit[0] / self.full.width, ox, oy)
+
+    # ---- 지연 진단 (F3) ----
+    def record_sample(self, render_started: float):
+        now = time.monotonic()
+        info = self.info
+        self.samples.append({
+            "time": now,
+            "latency": self.client.host_latency_ms(info),  # 호스트 캡처 -> 화면 (추정)
+            "capture": info["capture_ms"], "encode": info["encode_ms"], "recv": info["recv_ms"],
+            "decode": info["decode_ms"], "wait": (render_started - info["decoded_at"]) * 1000,
+            "render": (now - render_started) * 1000, "kb": info["kb"],
+        })
+
+    def toggle_overlay(self):
+        self.show_overlay = not self.show_overlay
+        state = "normal" if self.show_overlay else "hidden"
+        self.canvas.itemconfigure(self.overlay_bg, state=state)
+        self.canvas.itemconfigure(self.overlay_text, state=state)
+        self.overlay_at = 0.0
+
+    def update_overlay(self):
+        now = time.monotonic()
+        if now - self.overlay_at < self.OVERLAY_REFRESH_SEC:
+            return
+        self.overlay_at = now
+        recent = [s for s in self.samples if now - s["time"] <= 2.0]
+
+        def avg(key):
+            values = [s[key] for s in recent if s[key] is not None]
+            return sum(values) / len(values) if values else None
+
+        def ms(value):
+            return "측정 중" if value is None else f"{value:.0f}ms"
+
+        if recent:
+            fps = sum(1 for s in recent if now - s["time"] <= 1.0)
+            lines = [f"화면 갱신 {fps}fps · 프레임 {avg('kb'):.0f}KB",
+                     f"캡처→표시 지연(추정) {ms(avg('latency'))}",
+                     f"  호스트 캡처 {ms(avg('capture'))} · 인코딩 {ms(avg('encode'))}",
+                     f"  네트워크 수신 {ms(avg('recv'))}",
+                     f"  디코딩 {ms(avg('decode'))} · 대기 {ms(avg('wait'))} · 그리기 {ms(avg('render'))}"]
+        else:
+            lines = ["프레임이 오지 않는 중 (최근 2초)"]
+        lines.append(f"핑(제어 왕복) {ms(self.client.ping_ms)}")
+        self.canvas.itemconfigure(self.overlay_text, text="\n".join(lines))
+        x0, y0, x1, y1 = self.canvas.bbox(self.overlay_text)
+        self.canvas.coords(self.overlay_bg, x0 - 6, y0 - 4, x1 + 6, y1 + 4)
 
     def update_cursor(self):
         cur = self.client.cursor_state()

@@ -19,6 +19,7 @@ import sys
 import threading
 import time
 import traceback
+from collections import deque
 from ctypes import wintypes
 from io import BytesIO
 
@@ -142,7 +143,10 @@ def cursor_shape_msg(hcursor: int) -> dict:
 
 
 class StreamStats:
-    """실제로 나가는 fps / 인코딩 시간 / 프레임 크기를 STATS_SEC 마다 로그로 남긴다 (병목 확인용)."""
+    """실제 fps 와 단계별 시간(캡처/인코딩/전송/ACK 왕복)을 STATS_SEC 마다 로그로 남긴다 (병목 확인용).
+
+    전송 = sendall 이 끝나기까지 (느리면 네트워크/뷰어가 못 받고 있다는 뜻), ACK 왕복 = 전송 완료 후 뷰어의 ACK 가 올 때까지.
+    """
 
     def __init__(self, ip: str):
         self.ip = ip
@@ -150,18 +154,30 @@ class StreamStats:
 
     def reset(self) -> None:
         self.start = time.monotonic()
-        self.frames = self.bytes = 0
-        self.encode_sec = 0.0
+        self.frames = self.bytes = self.acks = 0
+        self.capture_sec = self.encode_sec = self.send_sec = self.ack_sec = 0.0
 
-    def add(self, size: int, encode_sec: float) -> None:
+    def add_frame(self, size: int, capture_sec: float, encode_sec: float, send_sec: float) -> None:
         self.frames += 1
         self.bytes += size
+        self.capture_sec += capture_sec
         self.encode_sec += encode_sec
+        self.send_sec += send_sec
         elapsed = time.monotonic() - self.start
         if elapsed >= STATS_SEC:
-            print(f"[{self.ip}] 실제 {self.frames / elapsed:.1f}fps · 인코딩 평균 {self.encode_sec / self.frames * 1000:.1f}ms"
-                  f" · 프레임 평균 {self.bytes / self.frames / 1024:.0f}KB")
+            self.report(elapsed)
             self.reset()
+
+    def add_ack(self, rtt_sec: float) -> None:
+        self.acks += 1
+        self.ack_sec += rtt_sec
+
+    def report(self, elapsed: float) -> None:
+        n = self.frames
+        ack_ms = self.ack_sec / self.acks * 1000 if self.acks else 0.0
+        print(f"[{self.ip}] 실제 {n / elapsed:.1f}fps · 캡처 {self.capture_sec / n * 1000:.1f}ms"
+              f" · 인코딩 {self.encode_sec / n * 1000:.1f}ms · 전송 {self.send_sec / n * 1000:.1f}ms"
+              f" · ACK 왕복 {ack_ms:.1f}ms · 프레임 {self.bytes / n / 1024:.0f}KB")
 
 
 def handle_client(conn: socket.socket, addr, password: str) -> None:
@@ -193,6 +209,7 @@ def handle_client(conn: socket.socket, addr, password: str) -> None:
         next_t = 0.0
         last_sent = 0.0
         inflight = 0  # 보냈지만 뷰어가 아직 ACK 하지 않은 프레임 수
+        sent_times: deque[float] = deque()  # 각 미확인 프레임을 다 보낸 시각 (ACK 왕복 측정용)
         cap = Capture()
         last_cur = None
         sent_shapes: set[int] = set()  # 뷰어에 이미 보낸 커서 모양 (핸들)
@@ -212,6 +229,8 @@ def handle_client(conn: socket.socket, addr, password: str) -> None:
                     mtype, payload = P.recv_msg(conn)
                     if mtype == P.T_ACK:
                         inflight = max(0, inflight - 1)
+                        if sent_times:
+                            stats.add_ack(time.monotonic() - sent_times.popleft())
                         continue
                     cmd = json.loads(payload.decode("utf-8"))
                     c = cmd.get("cmd")
@@ -231,6 +250,7 @@ def handle_client(conn: socket.socket, addr, password: str) -> None:
                             last_sent = 0.0  # 첫 프레임은 즉시 보낸다
                             next_t = 0.0
                             inflight = 0
+                            sent_times.clear()
                             last_cur = None
                             P.send_json(conn, {"type": "selected", "display": displays[i]})
                             print(f"[{ip}] {displays[i]['name']} 보기 시작 ({cap.backend}, 목표 {fps}fps)")
@@ -239,6 +259,8 @@ def handle_client(conn: socket.socket, addr, password: str) -> None:
                     elif c == "stop":
                         cap.close()
                         index = None
+                    elif c == "ping":  # 뷰어가 지연/시계 차이를 재기 위한 핑
+                        P.send_json(conn, {"type": "pong", "t": cmd.get("t"), "h": time.monotonic()})
                     elif c == "bye":
                         return
                 if index is None:
@@ -257,16 +279,21 @@ def handle_client(conn: socket.socket, addr, password: str) -> None:
                 now = time.monotonic()
                 if inflight and now - last_sent > ACK_TIMEOUT_SEC:
                     inflight = 0
+                    sent_times.clear()
                 if inflight >= P.MAX_INFLIGHT or now < next_t:
                     continue
                 # 변경 없음(None)이어도 첫 프레임/킵얼라이브 시점에는 강제로 한 장 보낸다
                 frame = cap.grab(force=(now - last_sent > KEEPALIVE_SEC))
                 if frame is not None:
-                    data = encode_frame(frame[0], frame[1], scale, quality)
-                    P.send_msg(conn, P.T_FRAME, data)
-                    inflight += 1
+                    t_cap = time.monotonic()
+                    jpeg = encode_frame(frame[0], frame[1], scale, quality)
+                    t_enc = time.monotonic()
+                    meta = P.FRAME_META.pack(t_cap, (t_cap - now) * 1000, (t_enc - t_cap) * 1000)
+                    P.send_msg(conn, P.T_FRAME, meta + jpeg)
                     last_sent = time.monotonic()
-                    stats.add(len(data), last_sent - now)
+                    inflight += 1
+                    sent_times.append(last_sent)
+                    stats.add_frame(len(jpeg), t_cap - now, t_enc - t_cap, last_sent - t_enc)
                 # 고정 간격을 유지한다 (인코딩이 늦었을 때만 밀린 만큼 건너뛰고 지금부터 다시 시작)
                 next_t = max(next_t + 1.0 / fps, now)
         finally:

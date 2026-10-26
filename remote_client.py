@@ -4,12 +4,15 @@
   connected(hello, displays) / displays(list) / selected(display) / error(msg) / closed(None)
 프레임은 최신 것 하나만 보관한다 (느린 디코딩/UI 가 프레임을 쌓지 않도록). 받는 즉시 호스트에 ACK 를 보내고,
 JPEG 디코딩·축소는 별도 스레드에서 한다. 커서는 영상과 따로 받아서 UI 가 위에 그린다.
+지연 진단: 프레임마다 단계별 시간(info)을 같이 돌려주고, 1초마다 핑으로 호스트와의 시계 차이/왕복 시간을 잰다.
 """
 import base64
 import json
 import queue
 import socket
 import threading
+import time
+from collections import deque
 from io import BytesIO
 
 from PIL import Image
@@ -30,22 +33,32 @@ class RemoteClient:
         self._closed = False
         self._send_lock = threading.Lock()  # 수신 스레드(ACK)와 UI 스레드(명령)가 같은 소켓에 쓴다
         self._lock = threading.Lock()
-        self._latest: tuple[Image.Image, Image.Image] | None = None  # (원본, 보기 창 크기에 맞춘 것)
+        self._latest: tuple[Image.Image, Image.Image, dict] | None = None  # (원본, 보기 창 크기에 맞춘 것, 진단 정보)
         self._seq = 0
         self._cursor = None  # (x, y, 모양 id) 또는 None
         self._shapes: dict[int, tuple[Image.Image, int, int]] = {}  # 모양 id -> (RGBA 이미지, 핫스팟 x, y)
         self.view_size: tuple[int, int] | None = None  # 보기 창 크기. 디코딩 스레드가 미리 이 크기로 줄여 둔다
-        self._pending: bytes | None = None  # 아직 디코딩 안 한 가장 최신 JPEG
+        self._pending: tuple[bytes, dict] | None = None  # 아직 디코딩 안 한 가장 최신 (JPEG, 진단 정보)
         self._cond = threading.Condition()
         self._finished = False
+        self._stopped = threading.Event()
+        self._clock_samples: deque[tuple[float, float]] = deque(maxlen=10)  # (핑 왕복 초, 호스트-뷰어 시계 차이)
+        self.clock_offset: float | None = None  # 호스트 monotonic - 뷰어 monotonic (왕복이 가장 짧았던 핑 기준)
+        self.ping_ms: float | None = None  # 제어 메시지 왕복. 프레임이 밀려 있으면 같이 커진다
 
     # ---- 프레임 ----
     def take_frame(self, last_seq: int):
-        """새 프레임이 있으면 (seq, 원본, 창 크기에 맞춘 것), 없으면 None."""
+        """새 프레임이 있으면 (seq, 원본, 창 크기에 맞춘 것, 진단 정보), 없으면 None."""
         with self._lock:
             if self._latest is None or self._seq == last_seq:
                 return None
             return (self._seq, *self._latest)
+
+    def host_latency_ms(self, info: dict) -> float | None:
+        """호스트가 이 프레임을 캡처한 뒤 지금까지 걸린 시간 추정(ms). 시계 차이를 아직 못 쟀으면 None."""
+        if self.clock_offset is None:
+            return None
+        return (time.monotonic() - (info["cap_ts"] - self.clock_offset)) * 1000
 
     def cursor_state(self):
         """(x, y, 모양 id, (RGBA 이미지, 핫스팟 x, y) 또는 None) 또는 커서가 안 보이면 None."""
@@ -54,12 +67,12 @@ class RemoteClient:
                 return None
             return (*self._cursor, self._shapes.get(self._cursor[2]))
 
-    def _offer_jpeg(self, payload: bytes | None) -> None:
+    def _offer_jpeg(self, item: tuple[bytes, dict] | None) -> None:
         """디코딩이 밀려 있으면 이전 프레임은 버리고 최신 것만 남긴다. (None 이면 디코딩 스레드 종료)"""
         with self._cond:
-            if payload is None:
+            if item is None:
                 self._finished = True
-            self._pending = payload
+            self._pending = item
             self._cond.notify()
 
     def _decode_loop(self) -> None:
@@ -70,15 +83,18 @@ class RemoteClient:
                     self._cond.wait()
                 if self._finished:
                     return
-                payload, self._pending = self._pending, None
+                (jpeg, info), self._pending = self._pending, None
+            start = time.monotonic()
             try:
-                full = Image.open(BytesIO(payload))
+                full = Image.open(BytesIO(jpeg))
                 full.load()
             except Exception:
                 continue
             fitted = self._fit(full)
+            info["decode_ms"] = (time.monotonic() - start) * 1000
+            info["decoded_at"] = time.monotonic()
             with self._lock:
-                self._latest = (full, fitted)
+                self._latest = (full, fitted, info)
                 self._seq += 1
 
     def _fit(self, full: Image.Image) -> Image.Image:
@@ -109,18 +125,23 @@ class RemoteClient:
             self.sock = s
             self._emit("connected", (hello, res["displays"]))
             threading.Thread(target=self._decode_loop, daemon=True).start()
+            threading.Thread(target=self._ping_loop, daemon=True).start()
 
             while True:
-                mtype, payload = P.recv_msg(s)
+                mtype, payload, recv_sec = P.recv_msg_timed(s)
                 if mtype == P.T_FRAME:
                     self._send_msg(P.T_ACK, b"")  # 받는 즉시 알려서 호스트가 다음 프레임을 보내게 한다
-                    self._offer_jpeg(payload)
+                    cap_ts, capture_ms, encode_ms = P.FRAME_META.unpack_from(payload)
+                    info = {"cap_ts": cap_ts, "capture_ms": capture_ms, "encode_ms": encode_ms,
+                            "recv_ms": recv_sec * 1000, "kb": (len(payload) - P.FRAME_META.size) / 1024}
+                    self._offer_jpeg((payload[P.FRAME_META.size:], info))
                 else:
                     self._handle_json(json.loads(payload.decode("utf-8")))
         except Exception as e:  # 연결 실패/끊김 전부 여기로
             if not self._closed:
                 self._emit("error", f"{type(e).__name__}: {e}" if not str(e) else str(e))
         finally:
+            self._stopped.set()
             self._offer_jpeg(None)
             if not self._closed:
                 self._emit("closed")
@@ -135,6 +156,8 @@ class RemoteClient:
             self._emit("selected", msg["display"])
         elif kind == "error":
             self._emit("error", msg.get("message", "오류"))
+        elif kind == "pong":
+            self._on_pong(msg["t"], msg["h"])
         elif kind == "cursor_shape":
             icon = Image.open(BytesIO(base64.b64decode(msg["png"]))).convert("RGBA")
             with self._lock:
@@ -142,6 +165,17 @@ class RemoteClient:
         elif kind == "cursor":
             with self._lock:
                 self._cursor = tuple(msg["pos"]) if msg["pos"] else None
+
+    def _ping_loop(self) -> None:
+        while not self._stopped.wait(1.0):
+            self._send({"cmd": "ping", "t": time.monotonic()})
+
+    def _on_pong(self, sent_at: float, host_time: float) -> None:
+        rtt = time.monotonic() - sent_at
+        self.ping_ms = rtt * 1000
+        # 호스트 시각이 왕복의 한가운데라고 가정한다. 프레임에 막혀 늦게 온 핑은 부정확하므로 왕복이 가장 짧은 것을 쓴다.
+        self._clock_samples.append((rtt, host_time - (sent_at + rtt / 2)))
+        self.clock_offset = min(self._clock_samples)[1]
 
     # ---- 명령 ----
     def _send_msg(self, mtype: int, payload: bytes) -> None:
